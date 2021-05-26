@@ -4,8 +4,8 @@ Math Word Problem Solving with Explicit Numerical Values
 
 ## Requirement
 
-- Python2.7
-- Pytorch 1.1.0
+- Python3.6
+- Pytorch 1.8.0
 - numpy
 - nltk
 

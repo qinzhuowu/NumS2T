@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 
 import os
+from parameter import *
 import torch.nn.functional as F
 import numpy as np
 import copy
@@ -40,12 +41,10 @@ class Score(nn.Module):
         score = score.squeeze(1)
         score = score.view(this_batch_size, -1)  # B x O
         if num_mask is not None:
-            if byte_flag==1:
-                num_mask=num_mask.byte()
-            else:
-                num_mask=num_mask.bool()
+            num_mask=num_mask.bool()
             score = score.masked_fill_(num_mask, -1e12)
         return score
+
 
 class TreeAttn(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -70,17 +69,15 @@ class TreeAttn(nn.Module):
         attn_energies = attn_energies.squeeze(1)
         attn_energies = attn_energies.view(max_len, this_batch_size).transpose(0, 1)  # B x S
         if seq_mask is not None:
-            if byte_flag==1:
-                seq_mask=seq_mask.byte()
-            else:
-                seq_mask=seq_mask.bool()
+            seq_mask=seq_mask.bool()
             attn_energies = attn_energies.masked_fill_(seq_mask, -1e12)
         attn_energies = nn.functional.softmax(attn_energies, dim=1)  # B x S
 
         return attn_energies.unsqueeze(1)
 
+
 class EncoderSeq(nn.Module):
-    def __init__(self, input_size, embedding_size, hidden_size,category_size, n_layers=2, dropout=0.5):
+    def __init__(self, input_size, embedding_size,pos_embedding_size, hidden_size,category_size,pretrain_emb, n_layers=2, dropout=0.5):
         super(EncoderSeq, self).__init__()
 
         self.input_size = input_size
@@ -88,45 +85,63 @@ class EncoderSeq(nn.Module):
         self.hidden_size = hidden_size
         self.n_layers = n_layers
         self.dropout = dropout
-        self.shrink_size=hidden_size-embedding_size-embedding_size
+        self.shrink_size=hidden_size
+        self.pos_embedding_size=pos_embedding_size
+        if USE_number_enc==True:
+            self.shrink_size=self.shrink_size-pos_embedding_size
+        if USE_self_attn==True:
+            self.shrink_size=self.shrink_size-pos_embedding_size
 
         self.embedding = nn.Embedding(input_size, embedding_size, padding_idx=0)
+        if USE_Glove_embedding==True:
+            self.embedding.weight.data.copy_(torch.from_numpy(pretrain_emb))
+            self.embedding.weight.requires_grad = False
+        
         self.em_dropout = nn.Dropout(dropout)
-        self.category_embedding = nn.Embedding(category_size, int(self.shrink_size/2), padding_idx=0)
         #self.gru_pade = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout, bidirectional=True)
 
-        self.gat_1 = GATLayer(self.shrink_size, self.shrink_size, 0.5, 0.1,concat=False )
-        self.gat_dense=nn.Linear(self.shrink_size*2,self.shrink_size)
+        if USE_KAS2T_encoder==False:
+            self.gru_pade = nn.GRU(embedding_size, self.shrink_size, n_layers, dropout=dropout, bidirectional=True)
+        else:
+            self.category_embedding = nn.Embedding(category_size, int(self.shrink_size/2), padding_idx=0)
+            self.gat_1 = GATLayer(self.shrink_size, self.shrink_size, 0.5, 0.1,concat=False )
+            self.gat_dense=nn.Linear(self.shrink_size*2,self.shrink_size)
 
+            self.gru_pade = nn.GRU(embedding_size, int(self.shrink_size/2), n_layers, dropout=dropout, bidirectional=True)
 
-        self.gru_pade = nn.GRU(embedding_size, int(self.shrink_size/2), n_layers, dropout=dropout, bidirectional=True)
+            if USE_G2T_stanford==True:
+                self.gcn = Graph_Module(int(self.shrink_size/2), int(self.shrink_size/2), int(self.shrink_size/2))
+            self.gat_n = [GraphAttentionLayer(int(self.shrink_size/2), int(self.shrink_size/2), 0.5, 0.1,concat=False ) for _ in range(8)]
+            for i, attention in enumerate(self.gat_n):
+                self.add_module('attention_{}'.format(i), attention)
+            
+            self.pos_embedding = PositionalEncoding(int(self.shrink_size/2), 160)
+            self.encoder_layers =EncoderLayer(self.shrink_size, 16, self.shrink_size, dropout)
+            self.encoder_layers2 =EncoderLayer(self.shrink_size, 4, self.shrink_size, dropout)
 
-        self.gat_n = [GraphAttentionLayer(int(self.shrink_size/2), int(self.shrink_size/2), 0.5, 0.1,concat=False ) for _ in range(8)]
-        for i, attention in enumerate(self.gat_n):
-            self.add_module('attention_{}'.format(i), attention)
+        if USE_gate==True:
+             self.enc_linear=nn.Linear(self.shrink_size, self.shrink_size)
+             self.enc_dense=nn.Linear(self.shrink_size, 1)
+             self.num_pos_embedding = nn.Embedding(2, pos_embedding_size, padding_idx=0)
+
+        if USE_cate==True:
+            self.type_linear=nn.Linear(self.shrink_size, self.shrink_size)
+            self.type_dense=nn.Linear(self.shrink_size, 5)
+            self.type_pos_embedding = nn.Embedding(5, pos_embedding_size, padding_idx=0)
+            
+        if USE_compare==True:
+            self.pair_score=nn.Linear(self.hidden_size,1)
+
+        if USE_number_enc==True:
+            self.dense_emb=nn.Linear(self.embedding_size, self.pos_embedding_size)
         
-        self.pos_embedding = PositionalEncoding(int(self.shrink_size/2), 160)
-        self.encoder_layers =EncoderLayer(self.shrink_size, 16, self.shrink_size, dropout)
-        self.encoder_layers2 =EncoderLayer(self.shrink_size, 4, self.shrink_size, dropout)
+            self.nums_char_embedding=nn.Embedding(16,pos_embedding_size,padding_idx=0)
+            self.pade_embedding = nn.Embedding(2, pos_embedding_size, padding_idx=0)
+            self.num_gru=nn.GRU(pos_embedding_size, pos_embedding_size, n_layers, dropout=dropout, bidirectional=True)
 
-        
-        self.enc_linear=nn.Linear(self.shrink_size, self.shrink_size)
-        self.enc_dense=nn.Linear(self.shrink_size, 1)
-        self.num_pos_embedding = nn.Embedding(2, embedding_size, padding_idx=0)
+            self.self_attn=SelfAttn(pos_embedding_size)
 
-
-        self.type_linear=nn.Linear(self.shrink_size, self.shrink_size)
-        self.type_dense=nn.Linear(self.shrink_size, 5)
-        self.type_pos_embedding = nn.Embedding(5, embedding_size, padding_idx=0)
-        
-        self.nums_char_embedding=nn.Embedding(16,embedding_size,padding_idx=0)
-        self.pade_embedding = nn.Embedding(2, embedding_size, padding_idx=0)
-        self.num_gru=nn.GRU(embedding_size, embedding_size, n_layers, dropout=dropout, bidirectional=True)
-
-        self.self_attn=SelfAttn(embedding_size)
-        self.pair_score=nn.Linear(self.hidden_size,1)
-
-    def forward(self, input_seqs, input_lengths,cate_word_edge,cate_index_input,cate_length,cate_id_match,nums_index,num_pos, hidden=None):
+    def forward(self, input_seqs, input_lengths,cate_word_edge,cate_index_input,cate_length,cate_id_match,nums_index,num_pos,batch_graph, hidden=None):
         # Note: we run this all at once (over multiple batches of multiple sequences)
         embedded = self.embedding(input_seqs)  # S x B x E
         embedded = self.em_dropout(embedded)
@@ -135,132 +150,158 @@ class EncoderSeq(nn.Module):
         pade_outputs, pade_hidden = self.gru_pade(packed, pade_hidden)
         pade_outputs, _ = torch.nn.utils.rnn.pad_packed_sequence(pade_outputs)
 
-
-        #problem_output = pade_outputs[-1, :, :self.hidden_size] + pade_outputs[0, :, self.hidden_size:]
-        pade_outputs = pade_outputs[:, :, :int(self.shrink_size/2)] + pade_outputs[:, :,int(self.shrink_size/2):]  # S x B x H
-        #problem_output=F.max_pool1d(pade_outputs.permute(1,2,0), pade_outputs.shape[0]).squeeze(-1) #(batch_size, d_model,S) (batch_size, d_model)
-
-        #encoder_outputs_knowledge=self.gat_1(pade_outputs.transpose(0,1),input_edge_batch)#B*S*H
-        #concat_pade_outputs=self.gat_dense(torch.cat((pade_outputs,encoder_outputs_knowledge.transpose(0,1)),2))
-        #return concat_pade_outputs, problem_output
+        #print("hidden_size")
+        #print(self.hidden_size)
+        #print("shrink_size")
+        #print(self.shrink_size)
+        if USE_KAS2T_encoder==False:
+            problem_output = pade_outputs[-1, :, :self.shrink_size] + pade_outputs[0, :, self.shrink_size:]
+            pade_outputs = pade_outputs[:, :, :self.shrink_size] + pade_outputs[:, :, self.shrink_size:]  # S x B x H
+            output=pade_outputs.transpose(0,1)
         
-        ##category_embedded=self.category_embedding(cate_index_input)#B*cate_num*hidden
-        #cate_length=[]#B cate_id_match=[]#B*C*[]
-        max_cate_len=max(cate_length)
-        
-
-        padding_hidden=self.category_embedding(torch.LongTensor([0]).cuda()).squeeze(0)
-        max_cate_len = max(cate_length)
-        if max_cate_len>0:
-            category_embedded_temp=[]
-            for idx in range(len(cate_length)):
-                idx_cate_len=cate_length[idx]
-                if idx_cate_len == 0:
-                    category_embedded_temp.append(torch.stack([padding_hidden for cate_idx in range(max_cate_len)],dim=0))#C*H
-                else:
-                    temp_hidden_category=[]
-                    for i in range(idx_cate_len):
-                        temp_hidden=[]
-                        for j in cate_id_match[idx][i]:
-                            temp_hidden.append(pade_outputs[j][idx])#cate*hidden
-                        gather_hidden=torch.stack(temp_hidden,dim=0).mean(0)#hidden
-                        temp_hidden_category.append(gather_hidden)
-                    for i in range(idx_cate_len,max_cate_len):
-                        temp_hidden_category.append(padding_hidden)
-                    category_embedded_temp.append(torch.stack(temp_hidden_category,0))#C*hidden
-            category_embedded = torch.stack(category_embedded_temp,0).detach()#B*S*H
-
-            concat_input_category=torch.cat((pade_outputs.transpose(0,1),category_embedded),1)#B*S+cate_num*hidden
         else:
-            concat_input_category=pade_outputs.transpose(0,1)
-        
-        input_sequence=input_seqs.transpose(0,1)
+            pade_outputs = pade_outputs[:, :, :int(self.shrink_size/2)] + pade_outputs[:, :,int(self.shrink_size/2):]  # S x B x H
 
-        encoder_outputs_knowledge = torch.stack([att(concat_input_category,cate_word_edge) for att in self.gat_n], dim=2)#B*S*N*head
-        encoder_outputs_knowledge=encoder_outputs_knowledge.mean(2)#B*S*N
+            if USE_G2T_stanford==True:
+                #print(pade_outputs.size())
+                _, pade_outputs = self.gcn(pade_outputs, batch_graph)#S*B*H,1*5*S*S
+                #print(batch_graph.size())
+                pade_outputs=pade_outputs.transpose(0,1).contiguous()
+                #print(pade_outputs.size())
+            max_cate_len=max(cate_length)
+            padding_hidden=self.category_embedding(torch.LongTensor([0]).cuda()).squeeze(0)
+            max_cate_len = max(cate_length)
+            if max_cate_len>0:
+                category_embedded_temp=[]
+                for idx in range(len(cate_length)):
+                    idx_cate_len=cate_length[idx]
+                    if idx_cate_len == 0:
+                        category_embedded_temp.append(torch.stack([padding_hidden for cate_idx in range(max_cate_len)],dim=0))#C*H
+                    else:
+                        temp_hidden_category=[]
+                        for i in range(idx_cate_len):
+                            temp_hidden=[]
+                            for j in cate_id_match[idx][i]:
+                                temp_hidden.append(pade_outputs[j][idx])#cate*hidden
+                            gather_hidden=torch.stack(temp_hidden,dim=0).mean(0)#hidden
+                            temp_hidden_category.append(gather_hidden)
+                        for i in range(idx_cate_len,max_cate_len):
+                            temp_hidden_category.append(padding_hidden)
+                        category_embedded_temp.append(torch.stack(temp_hidden_category,0))#C*hidden
+                category_embedded = torch.stack(category_embedded_temp,0).detach()#B*S*H
+
+                concat_input_category=torch.cat((pade_outputs.transpose(0,1),category_embedded),1)#B*S+cate_num*hidden
+            else:
+                concat_input_category=pade_outputs.transpose(0,1)
+            
+            input_sequence=input_seqs.transpose(0,1)
+
+            encoder_outputs_knowledge = torch.stack([att(concat_input_category,cate_word_edge) for att in self.gat_n], dim=2)#B*S*N*head
+            encoder_outputs_knowledge=encoder_outputs_knowledge.mean(2)#B*S*N
+            
+            #pos_embed= self.pos_embedding(input_lengths,max_cate_len)#B[B,S,H]
+            pos_embed= self.pos_embedding(input_lengths,max_cate_len)#B[B,S,H]
+            output=torch.cat((encoder_outputs_knowledge,pos_embed),2)#B[B,S,H]
+            
+            src_mask = (input_sequence != 0).unsqueeze(-2)
+            if max_cate_len > 0:
+                cat_mask = (cate_index_input != 0).unsqueeze(-2) #B*1*C
+                src_cat_mask=torch.cat((src_mask,cat_mask),2)
+            else:
+                src_cat_mask=src_mask
+            output, attention = self.encoder_layers(output, src_cat_mask)#[B,S,H] B*S*S
+            output=output[:,:input_seqs.size(0),:]#B*S*H
+            problem_output=F.max_pool1d(output.permute(0,2,1).contiguous(), output.shape[1]).squeeze(-1) #(batch_size, d_model,S) (batch_size, d_model)
+
+
+        #print(pade_outputs.size())
+        #print(encoder_outputs_knowledge.size())
+        #print(pos_embed.size())
+        #print(output.size())
+        gate_num=None
+        num_indicator=None
+        if USE_gate==True:
+            gate_hidden= self.enc_linear(output)#B*S*H
+            gate_num=torch.sigmoid(self.enc_dense(gate_hidden).squeeze(2))#B*S
+            zeros = torch.zeros_like(gate_num)
+            ones= torch.ones_like(gate_num)
+            num_indicator = torch.where(gate_num > 0.5, ones, zeros)#B*S
+            num_indicator_id=num_indicator.long()
+            num_pos_embedded=self.num_pos_embedding(num_indicator_id)#B*S*E
+
+        type_num=None
+        if USE_cate==True:
+            type_hidden= self.type_linear(output)#B*S*H
+            type_num=torch.sigmoid(self.type_dense(type_hidden))#B*S*5
+            _,type_num_indicator = torch.max(type_num,dim=2)#B*S
+            type_num_indicator_id=type_num_indicator.long()
+            type_num_pos_embedded=self.type_pos_embedding(type_num_indicator_id)#B*S*E
+            
         
-        #pos_embed= self.pos_embedding(input_lengths,max_cate_len)#B[B,S,H]
-        pos_embed= self.pos_embedding(input_lengths,max_cate_len)#B[B,S,H]
-        output=torch.cat((encoder_outputs_knowledge,pos_embed),2)#B[B,S,H]
+        if USE_number_enc==True:
+            dense_emb=self.dense_emb(embedded)
+            batch_size=len(input_lengths)
+            seq_len=input_seqs.size(0)
+            nums_hidden=[]
+            for b in range(batch_size):
+                nums_prob_hidden=[]
+                for num_i in range(len(nums_index[b])):
+                    nums_char_list=nums_index[b][num_i]
+                    nums_char_embedded=self.nums_char_embedding(torch.LongTensor(nums_char_list).cuda()).unsqueeze(1) #num_len*1*E
+                    #nums_dense_hidden=self.num_dense(nums_char_embedded)
+                    nums_gru_out,nums_gru_hidden=self.num_gru(nums_char_embedded)#num_len*1*E,1*1*E
+                    nums_gru_final=nums_gru_out[-1, :, :self.pos_embedding_size] + nums_gru_out[0, :, self.pos_embedding_size:]#1*E
+                    nums_prob_hidden.append(nums_gru_final.squeeze(0))##E
+                nums_hidden.append(nums_prob_hidden)
+
+            pade_hidden=self.pade_embedding(torch.LongTensor([0]).cuda()).squeeze(0)#E
+            all_problem_hidden=[]
+            problem_num_mask=[]
+            for b in range(batch_size):
+                single_problem_hidden=[]
+                single_num_mask=[]
+                for num_i in range(seq_len):
+                    if num_i in num_pos[b]:
+                        num_index=num_pos[b].index(num_i)
+                        single_problem_hidden.append(nums_hidden[b][num_index])
+                        single_num_mask.append(1)
+                    else:
+                        single_num_mask.append(0)
+                        single_problem_hidden.append(dense_emb[num_i,b,:])
+                single_problem_hidden=torch.stack(single_problem_hidden,0)#S*H
+                all_problem_hidden.append(single_problem_hidden)
+                problem_num_mask.append(single_num_mask)
+            all_problem_hidden=torch.stack(all_problem_hidden,1)#S*B*E
+            problem_num_mask=torch.FloatTensor(problem_num_mask).cuda()#B*S
+            
+            if USE_self_attn==True:
+                num_self_attn=self.self_attn(all_problem_hidden,problem_num_mask)#B*S*S
+                attn_problem_hidden=num_self_attn.bmm(all_problem_hidden.transpose(0,1))#B*S*E
+            else:
+                attn_problem_hidden=all_problem_hidden.transpose(0,1)
+        #pade_outputs_cat= torch.cat((output.transpose(0,1),all_problem_hidden,attn_problem_hidden.transpose(0,1)),2)#S*B*H
+        #problem_output_cat= torch.cat((problem_output,all_problem_hidden[-1,:,:],attn_problem_hidden[:,-1,:]),1)#B*H
         
-        src_mask = (input_sequence != 0).unsqueeze(-2)
-        if max_cate_len > 0:
-            cat_mask = (cate_index_input != 0).unsqueeze(-2) #B*1*C
-            src_cat_mask=torch.cat((src_mask,cat_mask),2)
+        if USE_number_enc==False:
+            pade_outputs_cat=output.transpose(0,1)
+            problem_output_cat=problem_output
+        elif USE_number_enc==True and USE_self_attn==False:
+            pade_outputs_cat= torch.cat((output.transpose(0,1),all_problem_hidden),2)#S*B*H
+            problem_output_cat= torch.cat((problem_output,all_problem_hidden[-1,:,:]),1)#B*H
         else:
-            src_cat_mask=src_mask
-        output, attention = self.encoder_layers(output, src_cat_mask)#[B,S,H] B*S*S
+            pade_outputs_cat= torch.cat((output.transpose(0,1),all_problem_hidden,attn_problem_hidden.transpose(0,1)),2)#S*B*H
+            problem_output_cat= torch.cat((problem_output,all_problem_hidden[-1,:,:],attn_problem_hidden[:,-1,:]),1)#B*H
         
-
-        ##############################################################################
-        output=output[:,:input_seqs.size(0),:]#B*S*H
-        #problem_output=F.max_pool1d(pade_outputs.permute(1,2,0), pade_outputs.shape[0]).squeeze(-1) #(batch_size, d_model,S) (batch_size, d_model)
-        problem_output=F.max_pool1d(output.permute(0,2,1).contiguous(), output.shape[1]).squeeze(-1) #(batch_size, d_model,S) (batch_size, d_model)
-
+        num_pair_score=None
+        if USE_compare==True:
+            #print(pade_outputs_cat.size())
+            #print(self.hidden_size)
+            num_pair_score=self.pair_score(pade_outputs_cat.transpose(0,1)).squeeze(2)#B*S
         
-        gate_hidden= self.enc_linear(output)#B*S*H
-        gate_num=torch.sigmoid(self.enc_dense(gate_hidden).squeeze(2))#B*S
-        zeros = torch.zeros_like(gate_num)
-        ones= torch.ones_like(gate_num)
-        num_indicator = torch.where(gate_num > 0.5, ones, zeros)#B*S
-        num_indicator_id=num_indicator.long()
-        num_pos_embedded=self.num_pos_embedding(num_indicator_id)#B*S*E
-        
-        #gate_num=None
-        #num_indicator=None
-
-        
-        type_hidden= self.type_linear(output)#B*S*H
-        type_num=torch.sigmoid(self.type_dense(type_hidden))#B*S*5
-        _,type_num_indicator = torch.max(type_num,dim=2)#B*S
-        type_num_indicator_id=type_num_indicator.long()
-        type_num_pos_embedded=self.type_pos_embedding(type_num_indicator_id)#B*S*E
-        
-        #type_num=None
-
-        batch_size=len(input_lengths)
-        seq_len=input_seqs.size(0)
-        nums_hidden=[]
-        for b in range(batch_size):
-            nums_prob_hidden=[]
-            for num_i in range(len(nums_index[b])):
-                nums_char_list=nums_index[b][num_i]
-                nums_char_embedded=self.nums_char_embedding(torch.LongTensor(nums_char_list).cuda()).unsqueeze(1) #num_len*1*E
-                #nums_dense_hidden=self.num_dense(nums_char_embedded)
-                nums_gru_out,nums_gru_hidden=self.num_gru(nums_char_embedded)#num_len*1*E,1*1*E
-                nums_gru_final=nums_gru_out[-1, :, :self.embedding_size] + nums_gru_out[0, :, self.embedding_size:]#1*E
-                nums_prob_hidden.append(nums_gru_final.squeeze(0))##E
-            nums_hidden.append(nums_prob_hidden)
-
-        pade_hidden=self.pade_embedding(torch.LongTensor([0]).cuda()).squeeze(0)#E
-        all_problem_hidden=[]
-        problem_num_mask=[]
-        for b in range(batch_size):
-            single_problem_hidden=[]
-            single_num_mask=[]
-            for num_i in range(seq_len):
-                if num_i in num_pos[b]:
-                    num_index=num_pos[b].index(num_i)
-                    single_problem_hidden.append(nums_hidden[b][num_index])
-                    single_num_mask.append(1)
-                else:
-                    single_num_mask.append(0)
-                    single_problem_hidden.append(embedded[num_i,b,:])
-            single_problem_hidden=torch.stack(single_problem_hidden,0)#S*H
-            all_problem_hidden.append(single_problem_hidden)
-            problem_num_mask.append(single_num_mask)
-        all_problem_hidden=torch.stack(all_problem_hidden,1)#S*B*E
-        problem_num_mask=torch.FloatTensor(problem_num_mask).cuda()#B*S
-        
-        num_self_attn=self.self_attn(all_problem_hidden,problem_num_mask)#B*S*S
-        attn_problem_hidden=num_self_attn.bmm(all_problem_hidden.transpose(0,1))#B*S*E
-        pade_outputs_cat= torch.cat((output.transpose(0,1),all_problem_hidden,attn_problem_hidden.transpose(0,1)),2)#S*B*H
-        problem_output_cat= torch.cat((problem_output,all_problem_hidden[-1,:,:],attn_problem_hidden[:,-1,:]),1)#B*H
-
-        num_pair_score=self.pair_score(pade_outputs_cat.transpose(0,1)).squeeze(2)#B*S
-
-
         return pade_outputs_cat, problem_output_cat,gate_num,num_indicator,problem_output,type_num,num_pair_score
+
+        #return pade_outputs, problem_output
+
 class SelfAttn(nn.Module):
     def __init__(self, hidden_size):
         super(SelfAttn, self).__init__()
@@ -301,120 +342,6 @@ class SelfAttn(nn.Module):
         '''
         attn_energies = nn.functional.softmax(attn_energies, dim=1)  # B x S*S
         return attn_energies
-
-
-class EncoderAPESeq(nn.Module):
-    def __init__(self, input_size, embedding_size, hidden_size,pretrain_emb, n_layers=2, dropout=0.5):
-        super(EncoderSeq, self).__init__()
-
-        self.input_size = input_size
-        self.embedding_size = embedding_size
-        self.pos_embed_size=128
-        self.hidden_size = hidden_size
-        self.n_layers = n_layers
-        self.dropout = dropout
-        self.shrink_size=hidden_size
-
-        self.embedding = nn.Embedding(input_size, embedding_size, padding_idx=0)
-        self.embedding.weight.data.copy_(torch.from_numpy(pretrain_emb))
-        #self.embedding.weight.requires_grad = False
-        self.em_dropout = nn.Dropout(dropout)
-        self.gru_pade = nn.GRU(embedding_size, self.shrink_size, n_layers, dropout=dropout, bidirectional=True)
-
-        self.dense_emb=nn.Linear(self.embedding_size, self.pos_embed_size)
-
-        self.enc_linear=nn.Linear(self.shrink_size, self.shrink_size)
-        self.enc_dense=nn.Linear(self.shrink_size, 1)
-        self.num_pos_embedding = nn.Embedding(2, self.pos_embed_size, padding_idx=0)
-        
-        self.type_linear=nn.Linear(self.shrink_size, self.shrink_size)
-        self.type_dense=nn.Linear(self.shrink_size, 5)
-        self.type_pos_embedding = nn.Embedding(5, self.pos_embed_size, padding_idx=0)
-
-        self.nums_char_embedding=nn.Embedding(16,self.pos_embed_size,padding_idx=0)
-        self.pade_embedding = nn.Embedding(2, self.pos_embed_size, padding_idx=0)
-        self.num_gru=nn.GRU(self.pos_embed_size, self.pos_embed_size, n_layers, dropout=dropout, bidirectional=True)
-
-        self.self_attn=SelfAttn(self.pos_embed_size)
-        self.pair_score=nn.Linear(self.hidden_size,1)
-    def forward(self, input_seqs, input_lengths,nums_index,num_pos, hidden=None):
-        # Note: we run this all at once (over multiple batches of multiple sequences)
-        embedded = self.embedding(input_seqs)  # S x B x E
-        embedded = self.em_dropout(embedded)
-        packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
-        pade_hidden = hidden
-        pade_outputs, pade_hidden = self.gru_pade(packed, pade_hidden)
-        pade_outputs, _ = torch.nn.utils.rnn.pad_packed_sequence(pade_outputs)
-
-        problem_output = pade_outputs[-1, :, :self.shrink_size] + pade_outputs[0, :, self.shrink_size:]
-        pade_outputs = pade_outputs[:, :, :self.shrink_size] + pade_outputs[:, :, self.shrink_size:]  # S x B x H
-        
-        gate_hidden= self.enc_linear(pade_outputs.transpose(0,1))#B*S*H
-        gate_num=torch.sigmoid(self.enc_dense(gate_hidden).squeeze(2))#B*S
-        zeros = torch.zeros_like(gate_num)
-        ones= torch.ones_like(gate_num)
-        num_indicator = torch.where(gate_num > 0.5, ones, zeros)#B*S
-        num_indicator_id=num_indicator.long()
-        num_pos_embedded=self.num_pos_embedding(num_indicator_id)#B*S*E
-
-        
-        
-        #gate_num=None
-        #num_indicator=None
-        
-        type_hidden= self.type_linear(pade_outputs.transpose(0,1))#B*S*H
-        type_num=torch.sigmoid(self.type_dense(type_hidden))#B*S*5
-        _,type_num_indicator = torch.max(type_num,dim=2)#B*S
-        type_num_indicator_id=type_num_indicator.long()
-        type_num_pos_embedded=self.type_pos_embedding(type_num_indicator_id)#B*S*E
-        
-        #type_num=None
-
-        batch_size=len(input_lengths)
-        seq_len=input_seqs.size(0)
-        nums_hidden=[]
-        for b in range(batch_size):
-            nums_prob_hidden=[]
-            for num_i in range(len(nums_index[b])):
-                nums_char_list=nums_index[b][num_i]
-                nums_char_embedded=self.nums_char_embedding(torch.LongTensor(nums_char_list).cuda()).unsqueeze(1) #num_len*1*E
-                #nums_dense_hidden=self.num_dense(nums_char_embedded)
-                nums_gru_out,nums_gru_hidden=self.num_gru(nums_char_embedded)#num_len*1*E,1*1*E
-                nums_gru_final=nums_gru_out[-1, :, :self.pos_embed_size] + nums_gru_out[0, :, self.pos_embed_size:]#1*E
-                nums_prob_hidden.append(nums_gru_final.squeeze(0))##E
-            nums_hidden.append(nums_prob_hidden)
-
-        dense_emb=self.dense_emb(embedded)
-        pade_hidden=self.pade_embedding(torch.LongTensor([0]).cuda()).squeeze(0)#E
-        all_problem_hidden=[]
-        problem_num_mask=[]
-        for b in range(batch_size):
-            single_problem_hidden=[]
-            single_num_mask=[]
-            for num_i in range(seq_len):
-                if num_i in num_pos[b]:
-                    num_index=num_pos[b].index(num_i)
-                    single_problem_hidden.append(nums_hidden[b][num_index])
-                    single_num_mask.append(1)
-                else:
-                    single_num_mask.append(0)
-                    single_problem_hidden.append(dense_emb[num_i,b,:])
-            single_problem_hidden=torch.stack(single_problem_hidden,0)#S*H
-            all_problem_hidden.append(single_problem_hidden)
-            problem_num_mask.append(single_num_mask)
-        all_problem_hidden=torch.stack(all_problem_hidden,1)#S*B*E
-        problem_num_mask=torch.FloatTensor(problem_num_mask).cuda()#B*S
-        
-        num_self_attn=self.self_attn(all_problem_hidden,problem_num_mask)#B*S*S
-        attn_problem_hidden=num_self_attn.bmm(all_problem_hidden.transpose(0,1))#B*S*E
-        
-        #pade_outputs_cat= torch.cat((pade_outputs,all_problem_hidden,attn_problem_hidden.transpose(0,1)),2)#S*B*H
-        #problem_output_cat= torch.cat((problem_output,all_problem_hidden[-1,:,:],attn_problem_hidden[:,-1,:]),1)#B*H
-        pade_outputs_cat=pade_outputs
-        problem_output_cat=problem_output
-        num_pair_score=self.pair_score(pade_outputs_cat.transpose(0,1)).squeeze(2)#B*S
-        return pade_outputs_cat, problem_output_cat,gate_num,num_indicator,problem_output,type_num,num_pair_score
-
 
 class Prediction(nn.Module):
     # a seq2tree decoder with Problem aware dynamic encoding
@@ -505,76 +432,7 @@ class Prediction(nn.Module):
         # return p_leaf, num_score, op, current_embeddings, current_attn
 
         return num_score, op, current_node, current_context, embedding_weight
-class Pivot(nn.Module):
-    # a seq2tree decoder with Problem aware dynamic encoding
-    def __init__(self, hidden_size, dropout=0.5):
-        super(Pivot, self).__init__()
-        self.hidden_size = hidden_size
-        
-        self.dec_linear=nn.Linear(hidden_size*2,hidden_size)
-        self.pivot_score= nn.Linear(hidden_size, 1)
 
-        self.gru = nn.GRU(hidden_size, hidden_size, 2, dropout=dropout, bidirectional=True)
-        
-    def forward(self, encoder_outputs,dec_states):
-        #encoder_outputs S*B*H  dec_states B*S*2H
-        enc_len=encoder_outputs.size(0)
-        dec_outputs=self.dec_linear(dec_states).transpose(0,1)#S*B*H
-        gru_input=torch.cat((encoder_outputs,dec_outputs),0)#S1+S2*B*H
-
-        pade_hidden = None
-        pade_outputs, pade_hidden = self.gru(gru_input, pade_hidden)#S*B*H
-        pade_outputs = pade_outputs[:, :, :self.hidden_size] + pade_outputs[:, :, self.hidden_size:]  # S x B x H
-        gru_output=pade_outputs[:enc_len,:,:].transpose(0,1)#B*S*H
-        binary_num_pivot=torch.sigmoid(self.pivot_score(gru_output).squeeze(2))#B*S
-
-        return binary_num_pivot
-
-class Sentence_level_semantics(nn.Module):
-    # a seq2tree decoder with Problem aware dynamic encoding
-    def __init__(self, hidden_size,embedding_size, dropout=0.5):
-        super(Sentence_level_semantics, self).__init__()
-
-        # Keep for reference
-        self.hidden_size = hidden_size
-        self.embedding_size = embedding_size
-        self.shrink_size=hidden_size-embedding_size-embedding_size-embedding_size
-
-        self.attn=nn.Linear(hidden_size+self.shrink_size,hidden_size)
-        self.attn1=nn.Linear(hidden_size+self.shrink_size,hidden_size)
-        self.score = nn.Linear(hidden_size, 1)
-        self.score1 = nn.Linear(hidden_size, 1)
-        
-        
-    def forward(self, problem_output,current_context):
-        #problem_output B*H1  current_context B*1*H2
-        batch=current_context.size(0)
-        repeat_dims=[batch,1,1]
-        repeat_dims2=[1,batch,1]
-        
-        enc_sen=problem_output.unsqueeze(1)#B*1*H1
-        dec_sen=current_context.squeeze(1).unsqueeze(0)#1*B*H2
-        enc_sen=enc_sen.repeat(*repeat_dims2)  # B x B x H1
-        dec_sen=dec_sen.repeat(*repeat_dims)  # B x B x H2
-
-        energy_in=torch.cat((enc_sen, dec_sen), 2)#B*B*2H
-        score_feature = torch.tanh(self.attn(energy_in))#B*B*H
-        attn_energies = self.score(score_feature).squeeze(2)  # B*B
-        #attn_energies = self.score(energy_in).squeeze(2)  # B*B
-        attn_score = nn.functional.softmax(attn_energies, dim=1)  # B x B
-
-        enc_sen1=problem_output.unsqueeze(0)#1*B*H
-        dec_sen1=current_context #B*1*H
-        enc_sen1=enc_sen1.repeat(*repeat_dims)  # B x B x H
-        dec_sen1=dec_sen1.repeat(*repeat_dims2)  # B x B x H
-
-        energy_in1=torch.cat((enc_sen1, dec_sen1), 2)#B*B*2H
-        score_feature1 = torch.tanh(self.attn(energy_in1))#B*B*H
-        attn_energies1 = self.score1(score_feature1).squeeze(2)  # B*B
-        #attn_energies1 = self.score1(energy_in1).squeeze(2)  # B*B
-        attn_score1 = nn.functional.softmax(attn_energies1, dim=1)  # B x B
-
-        return attn_score,attn_score1
 
 class GenerateNode(nn.Module):
     def __init__(self, hidden_size, op_nums, embedding_size, dropout=0.5):
@@ -627,7 +485,6 @@ class Merge(nn.Module):
         sub_tree_g = torch.sigmoid(self.merge_g(torch.cat((node_embedding, sub_tree_1, sub_tree_2), 1)))
         sub_tree = sub_tree * sub_tree_g
         return sub_tree
-
 
 class GraphAttentionLayer(nn.Module):
     def __init__(self, in_features, out_features, dropout, alpha, concat=True):
@@ -866,3 +723,253 @@ class GATLayer(nn.Module):
             return F.elu(h_prime)
         else:
             return h_prime
+
+    
+# Graph Module
+def clones(module, N):
+    "Produce N identical layers."
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+class Graph_LayerNorm(nn.Module):
+    "Construct a layernorm module (See citation for details)."
+    def __init__(self, features, eps=1e-6):
+        super(Graph_LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+class PositionwiseFeedForward(nn.Module):
+    "Implements FFN equation."
+    def __init__(self, d_model, d_ff,d_out, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_out)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+
+class Graph_Module(nn.Module):
+    def __init__(self, indim, hiddim, outdim, dropout=0.3):
+        super(Graph_Module, self).__init__()
+        '''
+        ## Variables:
+        - indim: dimensionality of input node features
+        - hiddim: dimensionality of the joint hidden embedding
+        - outdim: dimensionality of the output node features
+        - combined_feature_dim: dimensionality of the joint hidden embedding for graph
+        - K: number of graph nodes/objects on the image
+        '''
+        self.in_dim = indim
+        #self.combined_dim = outdim
+        
+        #self.edge_layer_1 = nn.Linear(indim, outdim)
+        #self.edge_layer_2 = nn.Linear(outdim, outdim)
+        
+        #self.dropout = nn.Dropout(p=dropout)
+        #self.edge_layer_1 = nn.utils.weight_norm(self.edge_layer_1)
+        #self.edge_layer_2 = nn.utils.weight_norm(self.edge_layer_2)
+        self.h = 4
+        self.d_k = outdim//self.h
+        
+        #layer = GCN(indim, hiddim, self.d_k, dropout)
+        self.graph = clones(GCN(indim, hiddim, self.d_k, dropout), 4)
+        
+        #self.Graph_0 = GCN(indim, hiddim, outdim//4, dropout)
+        #self.Graph_1 = GCN(indim, hiddim, outdim//4, dropout)
+        #self.Graph_2 = GCN(indim, hiddim, outdim//4, dropout)
+        #self.Graph_3 = GCN(indim, hiddim, outdim//4, dropout)
+        
+        self.feed_foward = PositionwiseFeedForward(indim, hiddim, outdim, dropout)
+        self.norm = Graph_LayerNorm(outdim)
+
+    def get_adj(self, graph_nodes):
+        '''
+        ## Inputs:
+        - graph_nodes (batch_size, K, in_feat_dim): input features
+        ## Returns:
+        - adjacency matrix (batch_size, K, K)
+        '''
+        self.K = graph_nodes.size(1)
+        graph_nodes = graph_nodes.contiguous().view(-1, self.in_dim)
+        
+        # layer 1
+        h = self.edge_layer_1(graph_nodes)
+        h = F.relu(h)
+        
+        # layer 2
+        h = self.edge_layer_2(h)
+        h = F.relu(h)
+
+        # outer product
+        h = h.view(-1, self.K, self.combined_dim)
+        adjacency_matrix = torch.matmul(h, h.transpose(1, 2))
+        
+        adjacency_matrix = self.b_normal(adjacency_matrix)
+
+        return adjacency_matrix
+    
+    def normalize(self, A, symmetric=True):
+        '''
+        ## Inputs:
+        - adjacency matrix (K, K) : A
+        ## Returns:
+        - adjacency matrix (K, K) 
+        '''
+        A = A + torch.eye(A.size(0)).cuda().float()
+        d = A.sum(1)
+        if symmetric:
+            # D = D^{-1/2}
+            D = torch.diag(torch.pow(d, -0.5))
+            return D.mm(A).mm(D)
+        else :
+            D = torch.diag(torch.pow(d,-1))
+            return D.mm(A)
+       
+    def b_normal(self, adj):
+        batch = adj.size(0)
+        for i in range(batch):
+            adj[i] = self.normalize(adj[i])
+        return adj
+
+    def forward(self, graph_nodes, graph):
+        '''
+        ## Inputs:
+        - graph_nodes (batch_size, K, in_feat_dim): input features
+        ## Returns:
+        - graph_encode_features (batch_size, K, out_feat_dim)
+        '''
+        nbatches = graph_nodes.size(0)
+        mbatches = graph.size(0)
+        if nbatches != mbatches:
+            graph_nodes = graph_nodes.transpose(0, 1)
+        # adj (batch_size, K, K): adjacency matrix
+        #print(graph.size())
+        #print("graph")
+        if not bool(graph.numel()):
+            #print("not boll")
+            adj = self.get_adj(graph_nodes)
+            #adj = adj.unsqueeze(1)
+            #adj = torch.cat((adj,adj,adj),1)
+            adj_list = [adj,adj,adj,adj]
+        else:
+            adj = graph.float()
+            adj_list = [adj[:,1,:],adj[:,1,:],adj[:,4,:],adj[:,4,:]]
+        #print(adj)
+        #print("#####################")
+        #print(graph.size)
+        #print(adj.size())
+        #adj_temp=adj[:,1,:]
+        #print(adj_temp.size())
+        #print("#####################")
+        g_feature = \
+            tuple([l(graph_nodes,x) for l, x in zip(self.graph,adj_list)])
+        #g_feature_0 = self.Graph_0(graph_nodes,adj[0])
+        #g_feature_1 = self.Graph_1(graph_nodes,adj[1])
+        #g_feature_2 = self.Graph_2(graph_nodes,adj[2])
+        #g_feature_3 = self.Graph_3(graph_nodes,adj[3])
+        #print('g_feature')
+        #print(type(g_feature))
+        
+        
+        g_feature = self.norm(torch.cat(g_feature,2)) + graph_nodes
+        #print('g_feature')
+        #print(g_feature.shape)
+        
+        graph_encode_features = self.feed_foward(g_feature) + g_feature
+        
+        return adj, graph_encode_features
+
+# GCN
+class GCN(nn.Module):
+    def __init__(self, in_feat_dim, nhid, out_feat_dim, dropout):
+        super(GCN, self).__init__()
+        '''
+        ## Inputs:
+        - graph_nodes (batch_size, K, in_feat_dim): input features
+        - adjacency matrix (batch_size, K, K)
+        ## Returns:
+        - gcn_enhance_feature (batch_size, K, out_feat_dim)
+        '''
+        self.gc1 = GraphConvolution(in_feat_dim, nhid)
+        self.gc2 = GraphConvolution(nhid, out_feat_dim)
+        self.dropout = dropout
+
+    def forward(self, x, adj):
+        x = F.relu(self.gc1(x, adj))
+        x = F.dropout(x, self.dropout, training=self.training)
+        x = self.gc2(x, adj)
+        return x
+    
+# Graph_Conv
+class GraphConvolution(nn.Module):
+    """
+    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
+    """
+
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, adj):
+        #print(input.shape)
+        #print(self.weight.shape)
+        support = torch.matmul(input, self.weight)#B*S*H
+        #print(adj.shape)
+        #print(support.shape)
+        output = torch.matmul(adj, support)#B*S*S
+        
+        if self.bias is not None:
+            return output + self.bias
+        else:
+            return output
+
+    def __repr__(self):
+        return self.__class__.__name__ + ' (' \
+               + str(self.in_features) + ' -> ' \
+               + str(self.out_features) + ')'
+
+
+class TransformerPositionalEncoding(nn.Module):
+
+    def __init__(self, d_model, pos_emb_base_pow=10000, **kwargs):
+        super(TransformerPositionalEncoding, self).__init__()
+        self.pos_emb_base_pow = pos_emb_base_pow
+        self.d_model = d_model
+
+    def forward(self, distance_bins,category_num):
+        dis_graph_expend=distance_bins.unsqueeze(1)#B*1*S*S
+        ZeroPad = nn.ZeroPad2d(padding=(0, category_num, 0, category_num))#B*1*S+c*S+C
+        dis_graph_expend = ZeroPad(dis_graph_expend)
+        input_pos=dis_graph_expend.squeeze(1).float()
+
+        device = distance_bins.device
+        freq_seq = torch.arange(0, self.d_model, 2.0, dtype=torch.float, device=device)
+        inv_freq = 1 / torch.pow(self.pos_emb_base_pow, (freq_seq / self.d_model))
+
+        batch_size, num_bins,num_bins = input_pos.shape
+        dists_flat = input_pos.reshape(-1)
+
+        sinusoid_inp = torch.einsum('i,d->id', dists_flat, inv_freq)#B*S*S,[H],B*S*S*H
+        pos_emb = torch.cat([torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)], dim=-1)
+        pos_emb = pos_emb.reshape([batch_size, num_bins,num_bins, self.d_model])
+
+        return pos_emb
